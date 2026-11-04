@@ -1,0 +1,255 @@
+name: Sync Upstream Releases
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 10 * * *'
+      timezone: America/Los_Angeles
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream-releases
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check sync token
+        env:
+          RELEASE_SYNC_TOKEN: ${{ secrets.RELEASE_SYNC_TOKEN }}
+        run: |
+          if [ -z "$RELEASE_SYNC_TOKEN" ]; then
+            echo "::error::请先添加 RELEASE_SYNC_TOKEN Secret；细粒度令牌需要当前仓库的 Contents、Workflows 和 Variables 读写权限。"
+            exit 1
+          fi
+
+      - name: Sync Releases & Assets
+        uses: actions/github-script@v8
+        with:
+          # 历史提交的 workflow 与当前分支不同时，GITHUB_TOKEN 权限不足。
+          github-token: ${{ secrets.RELEASE_SYNC_TOKEN }}
+          script: |
+            const destination = context.repo;
+            const { data: details } = await github.rest.repos.get(destination);
+            // 原仓库身份存入仓库变量，日常同步无需创建文件或提交代码。
+            const sourceVariable = 'RELEASE_SYNC_SOURCE_LOCK';
+            let sourceRecordLabel = `仓库变量 ${sourceVariable}`;
+            let sourceLock;
+            let hasSourceVariable = false;
+            function parseSourceLock(value) {
+              const record = JSON.parse(value);
+              if (!record || record.version !== 1 ||
+                  !Number.isSafeInteger(record.destination_repository_id) ||
+                  record.destination_repository_id <= 0 ||
+                  !Number.isSafeInteger(record.upstream_repository_id) ||
+                  record.upstream_repository_id <= 0 ||
+                  typeof record.upstream_full_name !== 'string' ||
+                  !/^[^/]+\/[^/]+$/.test(record.upstream_full_name)) {
+                throw new Error('原仓库身份记录格式不正确。');
+              }
+              return record;
+            }
+            try {
+              const { data } = await github.rest.actions.getRepoVariable({
+                ...destination, name: sourceVariable,
+              });
+              sourceLock = parseSourceLock(data.value);
+              hasSourceVariable = true;
+            } catch (error) {
+              if (error.status !== 404) {
+                throw new Error(`无法读取来源变量，已停止同步。请检查令牌的 Variables 权限：${error.message}`);
+              }
+            }
+            // 变量不存在时读取旧 JSON，核对身份后迁移；保留旧文件供用户手动删除。
+            if (!hasSourceVariable) {
+              for (const recordPath of ['.github/upstream-source-lock.json', '.github/release-sync-source.json']) {
+                try {
+                  const { data } = await github.rest.repos.getContent({
+                    ...destination, path: recordPath, ref: details.default_branch,
+                  });
+                  sourceLock = parseSourceLock(Buffer.from(data.content, 'base64').toString('utf8'));
+                  sourceRecordLabel = recordPath;
+                  break;
+                } catch (error) {
+                  if (error.status !== 404) {
+                    throw new Error(`无法读取 ${recordPath}，已停止同步：${error.message}`);
+                  }
+                }
+              }
+            }
+            if (sourceLock && sourceLock.destination_repository_id !== details.id) {
+              throw new Error(`原仓库身份记录属于另一个 Fork，已停止同步。请检查 ${sourceRecordLabel}。`);
+            }
+            if (!details.fork || !details.parent) {
+              throw new Error('原来的 Fork 上游关系已不存在，已停止同步；已有 Releases 和附件保留。');
+            }
+            if (sourceLock && (
+                sourceLock.upstream_repository_id !== details.parent.id ||
+                sourceLock.upstream_full_name.toLowerCase() !== details.parent.full_name.toLowerCase())) {
+              throw new Error(`上游发生变化，已停止同步：锁定 ${sourceLock.upstream_full_name}（ID ${sourceLock.upstream_repository_id}），当前 ${details.parent.full_name}（ID ${details.parent.id}）。已有内容保留。`);
+            }
+            const upstream = {
+              owner: details.parent.owner.login,
+              repo: details.parent.name,
+            };
+            let verifiedSource;
+            try {
+              verifiedSource = (await github.rest.repos.get(upstream)).data;
+            } catch (error) {
+              throw new Error(`原仓库无法访问，已停止同步；已有内容保留：${error.message}`);
+            }
+            const expectedId = sourceLock ? sourceLock.upstream_repository_id : details.parent.id;
+            const expectedName = sourceLock ? sourceLock.upstream_full_name : details.parent.full_name;
+            if (verifiedSource.id !== expectedId ||
+                verifiedSource.full_name.toLowerCase() !== expectedName.toLowerCase()) {
+              throw new Error('原仓库身份或地址发生变化，已停止同步；已有内容保留。');
+            }
+            if (!sourceLock) {
+              sourceLock = {
+                version: 1,
+                destination_repository_id: details.id,
+                upstream_repository_id: verifiedSource.id,
+                upstream_full_name: verifiedSource.full_name,
+              };
+            }
+            if (!hasSourceVariable) {
+              try {
+                await github.rest.actions.createRepoVariable({
+                  ...destination, name: sourceVariable, value: JSON.stringify(sourceLock),
+                });
+              } catch (error) {
+                throw new Error(`无法保存来源变量，已停止同步。请检查令牌的 Variables 写权限：${error.message}`);
+              }
+              console.log(`已保存原仓库身份至变量 ${sourceVariable}：${sourceLock.upstream_full_name}（ID ${sourceLock.upstream_repository_id}）`);
+            }
+            console.log(`同步公开上游 ${upstream.owner}/${upstream.repo} 的 Releases`);
+            const upstreamReleases = await github.paginate(github.rest.repos.listReleases, {
+              ...upstream,
+              per_page: 100,
+            });
+            const myReleases = await github.paginate(github.rest.repos.listReleases, {
+              ...destination,
+              per_page: 100,
+            });
+            const existing = new Map(myReleases.map(r => [r.tag_name, r]));
+
+            // 解析真实标签；target_commitish 可能只是 master，不能当作版本提交。
+            async function taggedCommit(repository, tag) {
+              const { data: reference } = await github.rest.git.getRef({
+                ...repository, ref: `tags/${tag}`,
+              });
+              let object = reference.object;
+              while (object.type === 'tag') {
+                const { data } = await github.rest.git.getTag({
+                  ...repository, tag_sha: object.sha,
+                });
+                object = data.object;
+              }
+              if (object.type !== 'commit') {
+                throw new Error(`标签 ${tag} 没有指向代码提交。`);
+              }
+              return object.sha;
+            }
+
+            // 从旧到新同步；重复标签以 GitHub 的标签发布页面为准。
+            const releases = new Map();
+            for (const rel of upstreamReleases
+              .filter(r => !r.draft)
+              .sort((a, b) => Date.parse(a.published_at) - Date.parse(b.published_at))) {
+              if (releases.has(rel.tag_name)) {
+                const { data } = await github.rest.repos.getReleaseByTag({
+                  ...upstream, tag: rel.tag_name,
+                });
+                releases.set(rel.tag_name, data);
+              } else {
+                releases.set(rel.tag_name, rel);
+              }
+            }
+            for (const rel of releases.values()) {
+              console.log(`正在同步 ${rel.tag_name}`);
+              const commit = await taggedCommit(upstream, rel.tag_name);
+              let localCommit;
+              try {
+                localCommit = await taggedCommit(destination, rel.tag_name);
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                await github.rest.git.createRef({
+                  ...destination, ref: `refs/tags/${rel.tag_name}`, sha: commit,
+                });
+              }
+              if (localCommit && localCommit !== commit) {
+                throw new Error(`本仓库的 ${rel.tag_name} 与上游提交不同，请先检查；不会覆盖已有标签。`);
+              }
+              let release = existing.get(rel.tag_name);
+              if (!release) {
+                const { data } = await github.rest.repos.createRelease({
+                  ...destination,
+                  tag_name: rel.tag_name,
+                  target_commitish: commit,
+                  name: rel.name || rel.tag_name,
+                  body: rel.body || "",
+                  draft: true,
+                  prerelease: rel.prerelease,
+                  make_latest: "false",
+                });
+                release = data;
+                existing.set(rel.tag_name, release);
+              }
+
+              // 已有 Release 也检查附件，上传中断后重跑可以补齐。
+              const assets = await github.paginate(github.rest.repos.listReleaseAssets, {
+                ...destination, release_id: release.id, per_page: 100,
+              });
+              for (const asset of rel.assets) {
+                const uploaded = assets.find(a => a.name === asset.name);
+                if (uploaded) {
+                  if (uploaded.size !== asset.size || uploaded.state !== 'uploaded') {
+                    throw new Error(`已有附件 ${asset.name} 大小或状态异常，请检查后重跑。`);
+                  }
+                  console.log(`  已有附件，跳过：${asset.name}`);
+                  continue;
+                }
+                console.log(`  下载并上传：${asset.name}`);
+                // 公开上游的下载地址无需携带本仓库令牌。
+                const response = await fetch(asset.browser_download_url);
+                if (!response.ok) throw new Error(`下载 ${asset.name} 失败：HTTP ${response.status}`);
+                const buffer = Buffer.from(await response.arrayBuffer());
+                if (buffer.length !== asset.size) throw new Error(`下载 ${asset.name} 大小不符。`);
+                await github.rest.repos.uploadReleaseAsset({
+                  ...destination,
+                  release_id: release.id,
+                  name: asset.name,
+                  label: asset.label || "",
+                  data: buffer,
+                  headers: {
+                    'content-type': asset.content_type || 'application/octet-stream',
+                    'content-length': buffer.length,
+                  },
+                });
+              }
+              if (release.draft) {
+                await github.rest.repos.updateRelease({
+                  ...destination, release_id: release.id, draft: false, make_latest: "false",
+                });
+                release.draft = false;
+              }
+            }
+
+            // 与上游保持相同的 Latest 标记。
+            let latest;
+            try {
+              latest = (await github.rest.repos.getLatestRelease(upstream)).data;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            if (latest && existing.has(latest.tag_name)) {
+              await github.rest.repos.updateRelease({
+                ...destination, release_id: existing.get(latest.tag_name).id, make_latest: "true",
+              });
+            }
+            console.log("全部 Releases 及附件同步完成。");
