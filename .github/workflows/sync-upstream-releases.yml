@@ -137,6 +137,13 @@ jobs:
               per_page: 100,
             });
             const existing = new Map(myReleases.map(r => [r.tag_name, r]));
+            const syncedTags = new Set();
+            const createdTags = [];
+            const conflicts = [];
+            function skipConflict(tag, reason) {
+              conflicts.push({ tag, reason });
+              core.warning(`${tag}：${reason}；保留本仓库原版本，跳过整个版本并继续同步其他版本。`);
+            }
 
             // 解析真实标签；target_commitish 可能只是 master，不能当作版本提交。
             async function taggedCommit(repository, tag) {
@@ -178,14 +185,36 @@ jobs:
                 localCommit = await taggedCommit(destination, rel.tag_name);
               } catch (error) {
                 if (error.status !== 404) throw error;
+              }
+              if (localCommit && localCommit !== commit) {
+                skipConflict(rel.tag_name, `标签提交不同（本仓库 ${localCommit}，上游 ${commit}）`);
+                continue;
+              }
+              let release = existing.get(rel.tag_name);
+              // 先检查整个版本的附件，避免发现冲突前已补入部分新版附件。
+              const assets = release ? await github.paginate(github.rest.repos.listReleaseAssets, {
+                ...destination, release_id: release.id, per_page: 100,
+              }) : [];
+              const changedAssets = rel.assets.filter(asset => {
+                const uploaded = assets.find(a => a.name === asset.name);
+                return uploaded && (uploaded.size !== asset.size ||
+                  (uploaded.digest && asset.digest && uploaded.digest !== asset.digest));
+              });
+              if (changedAssets.length) {
+                skipConflict(rel.tag_name, `同名附件内容发生变化：${changedAssets.map(a => a.name).join('、')}`);
+                continue;
+              }
+              for (const asset of rel.assets) {
+                const uploaded = assets.find(a => a.name === asset.name);
+                if (uploaded && uploaded.state !== 'uploaded') {
+                  throw new Error(`已有附件 ${asset.name} 上传状态异常，请检查后重跑。`);
+                }
+              }
+              if (!localCommit) {
                 await github.rest.git.createRef({
                   ...destination, ref: `refs/tags/${rel.tag_name}`, sha: commit,
                 });
               }
-              if (localCommit && localCommit !== commit) {
-                throw new Error(`本仓库的 ${rel.tag_name} 与上游提交不同，请先检查；不会覆盖已有标签。`);
-              }
-              let release = existing.get(rel.tag_name);
               if (!release) {
                 const { data } = await github.rest.repos.createRelease({
                   ...destination,
@@ -199,18 +228,13 @@ jobs:
                 });
                 release = data;
                 existing.set(rel.tag_name, release);
+                createdTags.push(rel.tag_name);
               }
 
               // 已有 Release 也检查附件，上传中断后重跑可以补齐。
-              const assets = await github.paginate(github.rest.repos.listReleaseAssets, {
-                ...destination, release_id: release.id, per_page: 100,
-              });
               for (const asset of rel.assets) {
                 const uploaded = assets.find(a => a.name === asset.name);
                 if (uploaded) {
-                  if (uploaded.size !== asset.size || uploaded.state !== 'uploaded') {
-                    throw new Error(`已有附件 ${asset.name} 大小或状态异常，请检查后重跑。`);
-                  }
                   console.log(`  已有附件，跳过：${asset.name}`);
                   continue;
                 }
@@ -238,18 +262,65 @@ jobs:
                 });
                 release.draft = false;
               }
+              syncedTags.add(rel.tag_name);
             }
 
-            // 与上游保持相同的 Latest 标记。
+            // 仅已核对并同步完成的版本可跟随上游设置 Latest。
             let latest;
             try {
               latest = (await github.rest.repos.getLatestRelease(upstream)).data;
             } catch (error) {
               if (error.status !== 404) throw error;
             }
-            if (latest && existing.has(latest.tag_name)) {
+            if (latest && syncedTags.has(latest.tag_name)) {
               await github.rest.repos.updateRelease({
                 ...destination, release_id: existing.get(latest.tag_name).id, make_latest: "true",
               });
+            } else if (latest) {
+              core.warning(`上游 Latest ${latest.tag_name} 未同步完成，本仓库保留当前 Latest 标记。`);
             }
-            console.log("全部 Releases 及附件同步完成。");
+            const result = `核对或同步完成 ${syncedTags.size} 个版本；新增 ${createdTags.length} 个版本；保留并跳过 ${conflicts.length} 个旧版本冲突。`;
+            console.log(result);
+            // Summary 使用 HTML，版本名、附件名等上游内容需转义后显示。
+            function escapeHtml(value) {
+              return String(value).replace(/[&<>"']/g, char => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+              })[char]);
+            }
+            function releaseLink(repository, tag, label) {
+              const base = context.serverUrl || 'https://github.com';
+              const url = `${base}/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/releases/tag/${encodeURIComponent(tag)}`;
+              return `<a href="${escapeHtml(url)}">${escapeHtml(label)}</a>`;
+            }
+            const checkedAt = new Intl.DateTimeFormat('zh-CN', {
+              timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit',
+              day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
+              hourCycle: 'h23', timeZoneName: 'short',
+            }).format(new Date());
+            core.summary
+              .addHeading(conflicts.length ? '⚠️ Release 同步完成，旧版冲突已保留' : '✅ Release 同步完成')
+              .addRaw(`<p>检查时间：${escapeHtml(checkedAt)}（America/Los_Angeles）</p>`)
+              .addRaw(`<p>${escapeHtml(result)}</p>`);
+            if (createdTags.length) {
+              core.summary
+                .addRaw(`<details><summary>查看本次新增版本（${createdTags.length} 个）</summary>`)
+                .addList(createdTags.map(tag => releaseLink(destination, tag, tag)))
+                .addRaw('</details>');
+            }
+            if (conflicts.length) {
+              core.summary
+                .addRaw(`<details><summary>查看旧版本冲突详情（${conflicts.length} 个，已保留备份）</summary>`)
+                .addRaw('<p><strong>以下版本与上游当前内容不同，已保留本仓库原内容并跳过整个版本。</strong>其余版本已完成核对或同步；绿色成功不代表冲突已消失。</p>')
+                .addTable([
+                  ['版本', '冲突原因', '本仓库记录', '上游当前版本'].map(data => ({ data, header: true })),
+                  ...conflicts.map(({ tag, reason }) => [
+                    escapeHtml(tag), escapeHtml(reason),
+                    existing.has(tag) ? releaseLink(destination, tag, '查看已保留的版本') : '保留原标签，尚无 Release',
+                    releaseLink(upstream, tag, '查看上游版本'),
+                  ]),
+                ])
+                .addRaw('<p>若只想保留历史备份，无需处理；下次仍会检查并显示这些冲突。若希望改用上游修订版，请先核实差异，再单独处理。</p>')
+                .addRaw('</details>');
+              console.log(JSON.stringify(conflicts, null, 2));
+            }
+            await core.summary.write();
